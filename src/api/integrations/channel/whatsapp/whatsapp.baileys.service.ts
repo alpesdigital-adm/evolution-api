@@ -274,6 +274,15 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  private _lastStream515At = 0;
+
+  // Reconnect behaviour for the Baileys "stream:error 515" sequence.
+  // After WhatsApp emits 515 it usually closes with `loggedOut`; that close is *not* a real logout
+  // and we should reconnect. We treat any close arriving within this grace window as 515-driven.
+  private static readonly STREAM_515_RECONNECT_GRACE_MS = 30_000;
+  // The numeric WhatsApp stream-error code that triggers the grace-period reconnect above.
+  private static readonly STREAM_ERROR_CODE_RECONNECT = '515';
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -444,7 +453,12 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'close') {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
+      // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
+      // a follow-up loggedOut is the expected restart signal — not an actual
+      // logout — so reconnect anyway.
+      const recentStream515 = Date.now() - this._lastStream515At < BaileysStartupService.STREAM_515_RECONNECT_GRACE_MS;
+      const shouldReconnect =
+        !codesToNotReconnect.includes(statusCode) || (statusCode === DisconnectReason.loggedOut && recentStream515);
       if (shouldReconnect) {
         await this.connectToWhatsapp(this.phoneNumber);
       } else {
@@ -734,6 +748,12 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     this.eventHandler();
+
+    this.client.ws.on('CB:stream:error', (node: { attrs?: { code?: string | number } }) => {
+      if (String(node?.attrs?.code) === BaileysStartupService.STREAM_ERROR_CODE_RECONNECT) {
+        this._lastStream515At = Date.now();
+      }
+    });
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
