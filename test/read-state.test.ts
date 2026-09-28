@@ -74,7 +74,7 @@ test('request schema requires an epoch-seconds timestamp and allows empty receip
   assert.equal(valid({ readMessages: [receipt], lastMessage: { ...lastMessage, messageTimestamp: 0 } }), false);
 });
 
-test('LID chats are accepted when the installed Baileys SDK recognizes them', async () => {
+test('LID chats are accepted by the same JID suffix contract', async () => {
   const lid = '123456789@lid';
   const { client, calls } = mockClient();
   await syncMessageReadState(client, {

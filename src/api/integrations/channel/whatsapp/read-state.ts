@@ -1,12 +1,14 @@
 import type { ReadMessageDto } from '@api/dto/chat.dto';
-import { isJidGroup, isLidUser, isPnUser, type proto, type WASocket } from 'baileys';
+import type { proto, WASocket } from 'baileys';
 
 export class ReadStateValidationError extends Error {}
 
 type ReadStateClient = Pick<WASocket, 'readMessages' | 'chatModify'>;
 
 function isChatJid(jid: string): boolean {
-  return !!(isJidGroup(jid) || isPnUser(jid) || isLidUser(jid));
+  // Baileys' isPnUser/isJidGroup/isLidUser check these suffixes. Keep this
+  // predicate local so focused tests need not load the full Baileys runtime.
+  return typeof jid === 'string' && /[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/.test(jid);
 }
 
 /** The legacy request still sends receipts alone. A lastMessage also syncs chat state to linked devices. */
