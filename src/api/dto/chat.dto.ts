@@ -69,6 +69,7 @@ class Key {
 export class ReadMessageDto {
   readMessages: Key[];
   lastMessage?: { key: Key; messageTimestamp: number };
+  lastMessages?: Array<{ key: Key; messageTimestamp: number }>;
 }
 
 export class LastMessage {
@@ -84,6 +85,7 @@ export class ArchiveChatDto {
 
 export class MarkChatUnreadDto {
   lastMessage?: LastMessage;
+  lastMessages?: LastMessage[];
   chat?: string;
 }
 

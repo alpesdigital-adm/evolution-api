@@ -3,15 +3,18 @@ import { test } from 'node:test';
 import type { ReadMessageDto } from '../src/api/dto/chat.dto';
 import {
   chatReadStateUpdates,
+  readStateMessageRange,
   ReadStateValidationError,
   syncMessageReadState,
 } from '../src/api/integrations/channel/whatsapp/read-state';
-import { readMessageSchema } from '../src/validate/chat.schema';
+import { markChatUnreadSchema, readMessageSchema } from '../src/validate/chat.schema';
 import { Validator } from 'jsonschema';
 
 const jid = '5511999999999@s.whatsapp.net';
 const otherJid = '5511888888888@s.whatsapp.net';
 const lastMessage = { key: { remoteJid: jid, fromMe: true, id: 'outbound-1' }, messageTimestamp: 1_790_000_000 };
+const inboundMessage = { key: { remoteJid: jid, fromMe: false, id: 'inbound-1' }, messageTimestamp: 1_789_999_999 };
+const lastMessages = [lastMessage, inboundMessage];
 const receipt = { remoteJid: jid, fromMe: false, id: 'inbound-1' };
 
 function mockClient(options: { failModify?: boolean; failReceipts?: boolean } = {}) {
@@ -36,42 +39,57 @@ test('legacy readMessages sends receipts without modifying chat state', async ()
   assert.deepEqual(calls, [{ command: 'readMessages', payload: [receipt] }]);
 });
 
-test('lastMessage synchronizes linked-device read state and sends inbound receipts', async () => {
+test('lastMessages synchronizes the complete reverse-chronological range and sends inbound receipts', async () => {
   const { client, calls } = mockClient();
-  await syncMessageReadState(client, { readMessages: [receipt], lastMessage });
+  await syncMessageReadState(client, { readMessages: [receipt], lastMessages });
   assert.deepEqual(calls, [
-    { command: 'chatModify', payload: { markRead: true, lastMessages: [lastMessage] }, jid },
+    { command: 'chatModify', payload: { markRead: true, lastMessages }, jid },
     { command: 'readMessages', payload: [receipt] },
   ]);
 });
 
-test('outbound lastMessage can clear a manually unread chat without inbound receipts', async () => {
+test('outbound cursor can clear a manually unread chat with a complete range but no receipts', async () => {
   const { client, calls } = mockClient();
-  await syncMessageReadState(client, { readMessages: [], lastMessage });
-  assert.deepEqual(calls, [{ command: 'chatModify', payload: { markRead: true, lastMessages: [lastMessage] }, jid }]);
+  await syncMessageReadState(client, { readMessages: [], lastMessages });
+  assert.deepEqual(calls, [{ command: 'chatModify', payload: { markRead: true, lastMessages }, jid }]);
 });
 
 test('mixed chats and missing timestamps fail before SDK effects', async () => {
   const { client, calls } = mockClient();
   await assert.rejects(
-    syncMessageReadState(client, { readMessages: [{ ...receipt, remoteJid: otherJid }], lastMessage }),
+    syncMessageReadState(client, { readMessages: [{ ...receipt, remoteJid: otherJid }], lastMessages }),
     ReadStateValidationError,
   );
   await assert.rejects(
-    syncMessageReadState(client, { readMessages: [receipt], lastMessage: { key: lastMessage.key } } as ReadMessageDto),
+    syncMessageReadState(client, { readMessages: [receipt], lastMessages: [{ key: lastMessage.key }] } as ReadMessageDto),
     ReadStateValidationError,
   );
+  await assert.rejects(syncMessageReadState(client, { readMessages: [receipt], lastMessage }), ReadStateValidationError);
+  await assert.rejects(syncMessageReadState(client, { readMessages: [receipt], lastMessages: [lastMessage] }), ReadStateValidationError);
+  await assert.rejects(syncMessageReadState(client, { readMessages: [receipt], lastMessages: [inboundMessage, lastMessage] }), ReadStateValidationError);
+  await assert.rejects(syncMessageReadState(client, { readMessages: [receipt], lastMessages: [lastMessage, { ...inboundMessage, messageTimestamp: 1_790_000_001 }] }), ReadStateValidationError);
+  await assert.rejects(syncMessageReadState(client, { readMessages: [receipt], lastMessages: [lastMessage, { ...inboundMessage, key: { ...inboundMessage.key, id: lastMessage.key.id } }] }), ReadStateValidationError);
   assert.deepEqual(calls, []);
 });
 
-test('request schema requires an epoch-seconds timestamp and allows empty receipts only with lastMessage', () => {
+test('request schema requires an epoch-seconds timestamp and allows empty receipts only with a range', () => {
   const validator = new Validator();
   const valid = (value: unknown) => validator.validate(value, readMessageSchema).valid;
   assert.equal(valid({ readMessages: [receipt] }), true);
-  assert.equal(valid({ readMessages: [], lastMessage }), true);
+  assert.equal(valid({ readMessages: [], lastMessages }), true);
   assert.equal(valid({ readMessages: [] }), false);
-  assert.equal(valid({ readMessages: [receipt], lastMessage: { key: lastMessage.key } }), false);
-  assert.equal(valid({ readMessages: [receipt], lastMessage: { ...lastMessage, messageTimestamp: 0 } }), false);
+  assert.equal(valid({ readMessages: [receipt], lastMessages: [{ key: lastMessage.key }] }), false);
+  assert.equal(valid({ readMessages: [receipt], lastMessages: [{ ...lastMessage, messageTimestamp: 0 }] }), false);
+  assert.equal(valid({ readMessages: [receipt], lastMessages: null }), false);
+});
+
+test('unread accepts a complete range and rejects an outbound-only legacy cursor before SDK use', () => {
+  const validator = new Validator();
+  assert.equal(validator.validate({ chat: jid, lastMessages }, markChatUnreadSchema).valid, true);
+  assert.deepEqual(readStateMessageRange({ lastMessages }), lastMessages);
+  assert.throws(() => readStateMessageRange({ lastMessage }), ReadStateValidationError);
+  assert.throws(() => readStateMessageRange({ lastMessages: [lastMessage, { ...inboundMessage, key: { ...inboundMessage.key, remoteJid: otherJid } }] }), ReadStateValidationError);
+  assert.equal(validator.validate({ chat: jid, lastMessages: [{ key: inboundMessage.key }] }, markChatUnreadSchema).valid, false);
 });
 
 test('LID chats are accepted by the same JID suffix contract', async () => {
@@ -79,7 +97,7 @@ test('LID chats are accepted by the same JID suffix contract', async () => {
   const { client, calls } = mockClient();
   await syncMessageReadState(client, {
     readMessages: [{ remoteJid: lid, fromMe: false, id: 'lid-inbound' }],
-    lastMessage: { key: { remoteJid: lid, fromMe: false, id: 'lid-inbound' }, messageTimestamp: 1_790_000_001 },
+    lastMessages: [{ key: { remoteJid: lid, fromMe: false, id: 'lid-inbound' }, messageTimestamp: 1_790_000_001 }],
   });
   assert.equal(calls[0].command, 'chatModify');
   assert.equal(calls[0].jid, lid);
@@ -88,11 +106,11 @@ test('LID chats are accepted by the same JID suffix contract', async () => {
 
 test('partial SDK failure never reports success', async () => {
   const modify = mockClient({ failModify: true });
-  await assert.rejects(syncMessageReadState(modify.client, { readMessages: [receipt], lastMessage }), /modify failed/);
+  await assert.rejects(syncMessageReadState(modify.client, { readMessages: [receipt], lastMessages }), /modify failed/);
   assert.deepEqual(modify.calls.map((call) => call.command), ['chatModify']);
 
   const receipts = mockClient({ failReceipts: true });
-  await assert.rejects(syncMessageReadState(receipts.client, { readMessages: [receipt], lastMessage }), /receipts failed/);
+  await assert.rejects(syncMessageReadState(receipts.client, { readMessages: [receipt], lastMessages }), /receipts failed/);
   assert.deepEqual(receipts.calls.map((call) => call.command), ['chatModify', 'readMessages']);
 });
 
