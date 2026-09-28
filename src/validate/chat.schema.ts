@@ -47,7 +47,6 @@ export const readMessageSchema: JSONSchema7 = {
   properties: {
     readMessages: {
       type: 'array',
-      minItems: 1,
       uniqueItems: true,
       items: {
         properties: {
@@ -59,8 +58,25 @@ export const readMessageSchema: JSONSchema7 = {
         ...isNotEmpty('id', 'remoteJid'),
       },
     },
+    lastMessage: {
+      type: 'object',
+      properties: {
+        key: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', minLength: 1 },
+            fromMe: { type: 'boolean' },
+            remoteJid: { type: 'string', minLength: 1 },
+          },
+          required: ['id', 'fromMe', 'remoteJid'],
+        },
+        messageTimestamp: { type: 'integer', minimum: 1 },
+      },
+      required: ['key', 'messageTimestamp'],
+    },
   },
   required: ['readMessages'],
+  anyOf: [{ properties: { readMessages: { minItems: 1 } } }, { required: ['lastMessage'] }],
 };
 
 export const archiveChatSchema: JSONSchema7 = {
@@ -109,7 +125,7 @@ export const markChatUnreadSchema: JSONSchema7 = {
           required: ['id', 'fromMe', 'remoteJid'],
           ...isNotEmpty('id', 'remoteJid'),
         },
-        messageTimestamp: { type: 'integer', minLength: 1 },
+        messageTimestamp: { type: 'integer', minimum: 1 },
       },
       required: ['key'],
       ...isNotEmpty('messageTimestamp'),

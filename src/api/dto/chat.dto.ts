@@ -68,6 +68,7 @@ class Key {
 }
 export class ReadMessageDto {
   readMessages: Key[];
+  lastMessage?: { key: Key; messageTimestamp: number };
 }
 
 export class LastMessage {

@@ -157,6 +157,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { chatReadStateUpdates, ReadStateValidationError, syncMessageReadState } from './read-state';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -805,9 +806,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
-      const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
-      });
+      const readStateObservedAt = new Date().toISOString();
+      const chatsRaw = chatReadStateUpdates(chats, this.instanceId, readStateObservedAt);
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 
@@ -3699,15 +3699,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
-      const keys: proto.IMessageKey[] = [];
-      data.readMessages.forEach((read) => {
-        if (isJidGroup(read.remoteJid) || isPnUser(read.remoteJid)) {
-          keys.push({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id });
-        }
-      });
-      await this.client.readMessages(keys);
-      return { message: 'Read messages', read: 'success' };
+      return await syncMessageReadState(this.client, data);
     } catch (error) {
+      if (error instanceof ReadStateValidationError) {
+        throw new BadRequestException(error.message);
+      }
       throw new InternalServerErrorException('Read messages fail', error.toString());
     }
   }
@@ -3773,7 +3769,7 @@ export class BaileysStartupService extends ChannelStartupService {
         last_message = await this.getLastMessage(number);
       } else {
         last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid;
       }
 
@@ -4325,7 +4321,10 @@ export class BaileysStartupService extends ChannelStartupService {
         return null;
       }
     });
-    __groupMetaChain = task.then(() => undefined, () => undefined);
+    __groupMetaChain = task.then(
+      () => undefined,
+      () => undefined,
+    );
     return task;
   }
 
