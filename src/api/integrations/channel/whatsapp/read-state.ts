@@ -1,4 +1,4 @@
-import type { ReadMessageDto } from '@api/dto/chat.dto';
+import type { LastMessage, ReadMessageDto } from '@api/dto/chat.dto';
 import type { proto, WASocket } from 'baileys';
 
 export class ReadStateValidationError extends Error {}
@@ -11,33 +11,66 @@ function isChatJid(jid: string): boolean {
   return typeof jid === 'string' && /[^@\s]+@(s\.whatsapp\.net|g\.us|lid)$/.test(jid);
 }
 
+/** The first entry is the displayed cursor; the final entry is the latest inbound message. */
+export function readStateMessageRange(data: {
+  lastMessage?: LastMessage;
+  lastMessages?: LastMessage[];
+}): LastMessage[] | undefined {
+  if (data.lastMessages && data.lastMessage) {
+    throw new ReadStateValidationError('Use lastMessages or lastMessage, not both');
+  }
+  const range = data.lastMessages ?? (data.lastMessage ? [data.lastMessage] : undefined);
+  if (!range) return undefined;
+  if (!Array.isArray(range) || range.length < 1 || range.length > 500) {
+    throw new ReadStateValidationError('lastMessages must contain 1 to 500 messages');
+  }
+  const jid = range[0]?.key?.remoteJid;
+  if (typeof jid !== 'string' || !isChatJid(jid)) {
+    throw new ReadStateValidationError('lastMessages requires a valid chat JID');
+  }
+  const ids = new Set<string>();
+  for (let index = 0; index < range.length; index++) {
+    const { key, messageTimestamp } = range[index] ?? {};
+    if (
+      !key ||
+      key.remoteJid !== jid ||
+      typeof key.id !== 'string' ||
+      !key.id.trim() ||
+      typeof key.fromMe !== 'boolean' ||
+      typeof messageTimestamp !== 'number' ||
+      !Number.isSafeInteger(messageTimestamp) ||
+      messageTimestamp < 100_000_000 ||
+      messageTimestamp >= 100_000_000_000 ||
+      (index > 0 && messageTimestamp > range[index - 1].messageTimestamp!) ||
+      ids.has(key.id) ||
+      (index < range.length - 1 && key.fromMe === false)
+    ) {
+      throw new ReadStateValidationError(
+        'lastMessages must be a complete reverse-chronological range ending at the latest inbound message',
+      );
+    }
+    ids.add(key.id);
+  }
+  if (range[range.length - 1].key.fromMe !== false) {
+    throw new ReadStateValidationError('lastMessages must end at an inbound message');
+  }
+  return range;
+}
+
 /** The legacy request still sends receipts alone. A lastMessage also syncs chat state to linked devices. */
 export async function syncMessageReadState(client: ReadStateClient, data: ReadMessageDto) {
   if (!Array.isArray(data.readMessages)) {
     throw new ReadStateValidationError('readMessages must be an array');
   }
 
-  const lastMessage = data.lastMessage;
-  if (lastMessage) {
-    const { key, messageTimestamp } = lastMessage;
-    if (
-      !key ||
-      typeof key.remoteJid !== 'string' ||
-      !isChatJid(key.remoteJid) ||
-      typeof key.id !== 'string' ||
-      !key.id.trim() ||
-      typeof key.fromMe !== 'boolean' ||
-      !Number.isSafeInteger(messageTimestamp) ||
-      messageTimestamp <= 0
-    ) {
-      throw new ReadStateValidationError('lastMessage requires a valid chat key and epoch-seconds messageTimestamp');
-    }
+  const range = readStateMessageRange(data);
+  if (range) {
     if (
       data.readMessages.some(
         (read) =>
           !read ||
           !isChatJid(read.remoteJid) ||
-          read.remoteJid !== key.remoteJid ||
+          read.remoteJid !== range[0].key.remoteJid ||
           !read.id ||
           typeof read.fromMe !== 'boolean',
       )
@@ -53,10 +86,10 @@ export async function syncMessageReadState(client: ReadStateClient, data: ReadMe
     .map((read) => ({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id }));
 
   // Run validation before either external call. A failure in either call propagates to the HTTP request.
-  if (lastMessage) {
-    await client.chatModify({ markRead: true, lastMessages: [lastMessage] }, lastMessage.key.remoteJid);
+  if (range) {
+    await client.chatModify({ markRead: true, lastMessages: range }, range[0].key.remoteJid);
   }
-  if (keys.length > 0 || !lastMessage) {
+  if (keys.length > 0 || !range) {
     await client.readMessages(keys);
   }
   return { message: 'Read messages', read: 'success' };

@@ -157,7 +157,12 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
-import { chatReadStateUpdates, ReadStateValidationError, syncMessageReadState } from './read-state';
+import {
+  chatReadStateUpdates,
+  readStateMessageRange,
+  ReadStateValidationError,
+  syncMessageReadState,
+} from './read-state';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -3762,25 +3767,19 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markChatUnread(data: MarkChatUnreadDto) {
     try {
-      let last_message = data.lastMessage;
-      let number = data.chat;
-
-      if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
-        number = last_message?.key?.remoteJid;
+      const supplied = data.lastMessages ?? data.lastMessage;
+      const range = readStateMessageRange(
+        supplied ? data : { lastMessage: data.chat ? await this.getLastMessage(data.chat) : undefined },
+      );
+      if (!range) throw new ReadStateValidationError('Last message not found');
+      if (data.chat && createJid(data.chat) !== createJid(range[0].key.remoteJid)) {
+        throw new ReadStateValidationError('chat and lastMessages must belong to the same chat');
       }
+      await this.client.chatModify({ markRead: false, lastMessages: range }, createJid(range[0].key.remoteJid));
 
-      if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
-      }
-
-      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, createJid(number));
-
-      return { chatId: number, markedChatUnread: true };
+      return { chatId: range[0].key.remoteJid, markedChatUnread: true };
     } catch (error) {
+      if (error instanceof ReadStateValidationError) throw new BadRequestException(error.message);
       throw new InternalServerErrorException({
         markedChatUnread: false,
         message: ['An error occurred while marked unread the chat. Open a calling.', error.toString()],
