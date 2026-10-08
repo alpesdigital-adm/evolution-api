@@ -102,3 +102,49 @@ export async function resolveReadStateLids(
     }),
   );
 }
+
+/**
+ * The inverse of resolveReadStateLids. Webhook consumers only ever see the
+ * phone JID, but chats migrated to LID addressing are indexed by LID on the
+ * phone: receipts and app-state patches must address the LID or they target a
+ * chat the primary device does not know.
+ */
+export async function toChatAddressingJid(
+  jid: string,
+  resolveLid: (pn: string) => Promise<string | null | undefined>,
+): Promise<string> {
+  if (typeof jid !== 'string' || !jid.endsWith('@s.whatsapp.net')) return jid;
+  let lid: string | null | undefined;
+  try {
+    lid = await resolveLid(jid);
+  } catch {
+    lid = null;
+  }
+  const user = typeof lid === 'string' && lid.endsWith('@lid') ? lid.split('@')[0].split(':')[0] : '';
+  return /^\d{8,20}$/.test(user) ? `${user}@lid` : jid;
+}
+
+export async function readRequestToChatAddressing(
+  data: ReadMessageDto,
+  resolveLid: (pn: string) => Promise<string | null | undefined>,
+): Promise<ReadMessageDto> {
+  const jids = new Set<string>();
+  if (data.lastMessage?.key?.remoteJid) jids.add(data.lastMessage.key.remoteJid);
+  if (Array.isArray(data.readMessages)) for (const read of data.readMessages) if (read?.remoteJid) jids.add(read.remoteJid);
+  const mapped = new Map<string, string>();
+  for (const jid of jids) mapped.set(jid, await toChatAddressingJid(jid, resolveLid));
+  return {
+    ...data,
+    readMessages: Array.isArray(data.readMessages)
+      ? data.readMessages.map((read) => (read?.remoteJid ? { ...read, remoteJid: mapped.get(read.remoteJid) } : read))
+      : data.readMessages,
+    ...(data.lastMessage?.key
+      ? {
+          lastMessage: {
+            ...data.lastMessage,
+            key: { ...data.lastMessage.key, remoteJid: mapped.get(data.lastMessage.key.remoteJid) ?? data.lastMessage.key.remoteJid },
+          },
+        }
+      : {}),
+  } as ReadMessageDto;
+}

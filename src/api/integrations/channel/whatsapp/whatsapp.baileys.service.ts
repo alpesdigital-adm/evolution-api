@@ -160,8 +160,10 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import {
   chatReadStateUpdates,
   ReadStateValidationError,
+  readRequestToChatAddressing,
   resolveReadStateLids,
   syncMessageReadState,
+  toChatAddressingJid,
 } from './read-state';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
@@ -3707,7 +3709,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
-      return await syncMessageReadState(this.client, data);
+      const addressed = await readRequestToChatAddressing(data, (pn) =>
+        this.client.signalRepository.lidMapping.getLIDForPN(pn),
+      );
+      return await syncMessageReadState(this.client, addressed);
     } catch (error) {
       if (error instanceof ReadStateValidationError) {
         throw new BadRequestException(error.message);
@@ -3785,7 +3790,15 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found');
       }
 
-      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, createJid(number));
+      const resolveLid = (pn: string) => this.client.signalRepository.lidMapping.getLIDForPN(pn);
+      const chatJid = await toChatAddressingJid(createJid(number), resolveLid);
+      if (last_message?.key?.remoteJid) {
+        last_message = {
+          ...last_message,
+          key: { ...last_message.key, remoteJid: await toChatAddressingJid(last_message.key.remoteJid, resolveLid) },
+        };
+      }
+      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, chatJid);
 
       return { chatId: number, markedChatUnread: true };
     } catch (error) {

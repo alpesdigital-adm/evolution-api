@@ -4,7 +4,9 @@ import type { ReadMessageDto } from '../src/api/dto/chat.dto';
 import {
   chatReadStateUpdates,
   ReadStateValidationError,
+  readRequestToChatAddressing,
   resolveReadStateLids,
+  toChatAddressingJid,
   syncMessageReadState,
 } from '../src/api/integrations/channel/whatsapp/read-state';
 import { readMessageSchema } from '../src/validate/chat.schema';
@@ -148,4 +150,23 @@ test('chats.update keyed by LID is re-keyed to the phone JID, keeping the LID', 
     { remoteJid: '888888888888888@lid', instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: 0 },
     { remoteJid: jid, instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: 0 },
   ]);
+});
+
+test('commands from webhook consumers are re-addressed to the LID the phone uses', async () => {
+  const resolveLid = async (pn: string) => (pn === jid ? '55761694654630:3@lid' : null);
+  assert.equal(await toChatAddressingJid(jid, resolveLid), '55761694654630@lid');
+  assert.equal(await toChatAddressingJid(otherJid, resolveLid), otherJid);
+  assert.equal(await toChatAddressingJid('123@g.us', resolveLid), '123@g.us');
+  assert.equal(await toChatAddressingJid(jid, async () => { throw new Error('down'); }), jid);
+
+  const addressed = await readRequestToChatAddressing(
+    { readMessages: [receipt], lastMessage } as unknown as ReadMessageDto,
+    resolveLid,
+  );
+  assert.equal(addressed.readMessages[0].remoteJid, '55761694654630@lid');
+  assert.equal(addressed.lastMessage?.key.remoteJid, '55761694654630@lid');
+  assert.equal(addressed.lastMessage?.key.id, 'outbound-1');
+  const { client, calls } = mockClient();
+  await syncMessageReadState(client, addressed);
+  assert.equal(calls[0].jid, '55761694654630@lid');
 });
