@@ -4,6 +4,7 @@ import type { ReadMessageDto } from '../src/api/dto/chat.dto';
 import {
   chatReadStateUpdates,
   ReadStateValidationError,
+  resolveReadStateLids,
   syncMessageReadState,
 } from '../src/api/integrations/channel/whatsapp/read-state';
 import { readMessageSchema } from '../src/validate/chat.schema';
@@ -113,5 +114,38 @@ test('chats.update retains zero, manual-unread marker, and positive delta with o
     { remoteJid: otherJid, instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: -1 },
     { remoteJid: '123@g.us', instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: 3 },
     { remoteJid: '456@g.us', instanceId: 'instance-1', readStateObservedAt: observedAt },
+  ]);
+});
+
+test('chats.update keyed by LID is re-keyed to the phone JID, keeping the LID', async () => {
+  const observedAt = '2026-10-08T12:00:00.000Z';
+  const resolved = await resolveReadStateLids(
+    chatReadStateUpdates(
+      [
+        { id: '123456789012345@lid', unreadCount: 0 },
+        { id: '999999999999999@lid', unreadCount: -1 },
+        { id: '888888888888888@lid', unreadCount: 0 },
+        { id: jid, unreadCount: 0 },
+      ],
+      'instance-1',
+      observedAt,
+    ),
+    async (lid) => {
+      if (lid === '123456789012345@lid') return '5548991554955:12@s.whatsapp.net';
+      if (lid === '888888888888888@lid') throw new Error('mapping store down');
+      return null;
+    },
+  );
+  assert.deepEqual(resolved, [
+    {
+      remoteJid: '5548991554955@s.whatsapp.net',
+      lid: '123456789012345@lid',
+      instanceId: 'instance-1',
+      readStateObservedAt: observedAt,
+      unreadCount: 0,
+    },
+    { remoteJid: '999999999999999@lid', instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: -1 },
+    { remoteJid: '888888888888888@lid', instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: 0 },
+    { remoteJid: jid, instanceId: 'instance-1', readStateObservedAt: observedAt, unreadCount: 0 },
   ]);
 });

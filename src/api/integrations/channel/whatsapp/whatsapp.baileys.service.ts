@@ -157,7 +157,12 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
-import { chatReadStateUpdates, ReadStateValidationError, syncMessageReadState } from './read-state';
+import {
+  chatReadStateUpdates,
+  ReadStateValidationError,
+  resolveReadStateLids,
+  syncMessageReadState,
+} from './read-state';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -807,7 +812,10 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       const readStateObservedAt = new Date().toISOString();
-      const chatsRaw = chatReadStateUpdates(chats, this.instanceId, readStateObservedAt);
+      const chatsRaw = await resolveReadStateLids(
+        chatReadStateUpdates(chats, this.instanceId, readStateObservedAt),
+        (lid) => this.client.signalRepository.lidMapping.getPNForLID(lid),
+      );
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
 

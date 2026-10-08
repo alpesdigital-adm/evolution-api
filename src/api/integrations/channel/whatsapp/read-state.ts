@@ -74,3 +74,31 @@ export function chatReadStateUpdates(
     ...(Number.isInteger(chat.unreadCount) ? { unreadCount: chat.unreadCount } : {}),
   }));
 }
+
+type ChatReadStateUpdate = ReturnType<typeof chatReadStateUpdates>[number];
+
+/**
+ * Chats are keyed by LID on recent accounts, but inbound messages are already
+ * normalized to the phone JID (key.remoteJidAlt). Emit the phone JID too so
+ * webhook consumers can match the read state to the same conversation.
+ * The original LID is kept in `lid`; unresolved LIDs pass through unchanged.
+ */
+export async function resolveReadStateLids(
+  updates: ChatReadStateUpdate[],
+  resolvePn: (lid: string) => Promise<string | null | undefined>,
+) {
+  return Promise.all(
+    updates.map(async (update) => {
+      if (typeof update.remoteJid !== 'string' || !update.remoteJid.endsWith('@lid')) return update;
+      let pn: string | null | undefined;
+      try {
+        pn = await resolvePn(update.remoteJid);
+      } catch {
+        pn = null;
+      }
+      const user = typeof pn === 'string' ? pn.split('@')[0].split(':')[0] : '';
+      if (!/^\d{8,15}$/.test(user)) return update;
+      return { ...update, remoteJid: `${user}@s.whatsapp.net`, lid: update.remoteJid };
+    }),
+  );
+}
