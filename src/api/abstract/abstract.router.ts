@@ -53,7 +53,10 @@ export abstract class RouterBroker {
     }
 
     if (request.originalUrl.includes('/instance/create')) {
-      Object.assign(instance, sanitizeUntrustedInput(body));
+      // No authenticated instance exists in the path on create, so there is
+      // nothing to override; the body IS the instance (its name included).
+      // Sanitizing it here stripped instanceName and broke instance creation.
+      Object.assign(instance, body);
     }
 
     Object.assign(ref, body);
