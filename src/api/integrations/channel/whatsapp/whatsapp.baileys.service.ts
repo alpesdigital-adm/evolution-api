@@ -1098,11 +1098,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
-            if (participantJid && contactsMap.has(participantJid)) {
-              m.pushName = contactsMap.get(participantJid).name;
-            } else if (participantJid) {
-              m.pushName = participantJid.split('@')[0];
-            }
+            // Contacts may be keyed by the phone JID while the message is LID-addressed.
+            const known = [participantJid, m.key.participantAlt, m.key.remoteJidAlt].find(
+              (jid) => jid && contactsMap.has(jid) && contactsMap.get(jid).name,
+            );
+            // No digits fallback: a JID is not a name, and consumers would store it as one.
+            if (known) m.pushName = contactsMap.get(known).name;
           }
 
           messagesRaw.push(this.prepareMessage(m));
