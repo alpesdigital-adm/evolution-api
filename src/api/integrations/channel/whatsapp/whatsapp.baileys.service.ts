@@ -693,6 +693,11 @@ export class BaileysStartupService extends ChannelStartupService {
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
+      // Baileys ships with app-state MAC checks off. With them off, an app-state
+      // patch decoded with the wrong key is dropped silently and our own patches
+      // can go out inconsistent (the server answers 401 device_removed). Fail
+      // closed: an invalid patch MAC makes Baileys refetch a snapshot instead.
+      appStateMacVerification: { patch: true, snapshot: true },
       getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
       ...browserOptions,
       markOnlineOnConnect: this.localSettings.alwaysOnline,
