@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import type { ReadMessageDto } from '../src/api/dto/chat.dto';
 import {
   chatReadStateUpdates,
+  fillRemoteJidAlt,
   ReadStateValidationError,
   readRequestToChatAddressing,
   resolveReadStateLids,
@@ -169,4 +170,27 @@ test('commands from webhook consumers are re-addressed to the LID the phone uses
   const { client, calls } = mockClient();
   await syncMessageReadState(client, addressed);
   assert.equal(calls[0].jid, '55761694654630@lid');
+});
+
+test('LID-only message keys get the phone JID from the LID mapping', async () => {
+  const resolve = async (lid: string) => (lid === '202860566425607@lid' ? '5511964242104:0@s.whatsapp.net' : null);
+  const known = { remoteJid: '202860566425607@lid' } as { remoteJid: string; remoteJidAlt?: string };
+  await fillRemoteJidAlt(known, resolve);
+  assert.equal(known.remoteJidAlt, '5511964242104@s.whatsapp.net');
+
+  const unknown = { remoteJid: '999999999999999@lid' } as { remoteJid: string; remoteJidAlt?: string };
+  await fillRemoteJidAlt(unknown, resolve);
+  assert.equal(unknown.remoteJidAlt, undefined);
+
+  const already = { remoteJid: '202860566425607@lid', remoteJidAlt: '5500000000000@s.whatsapp.net' };
+  await fillRemoteJidAlt(already, resolve);
+  assert.equal(already.remoteJidAlt, '5500000000000@s.whatsapp.net');
+
+  const phone = { remoteJid: jid } as { remoteJid: string; remoteJidAlt?: string };
+  await fillRemoteJidAlt(phone, resolve);
+  assert.equal(phone.remoteJidAlt, undefined);
+
+  const failing = { remoteJid: '202860566425607@lid' } as { remoteJid: string; remoteJidAlt?: string };
+  await fillRemoteJidAlt(failing, async () => { throw new Error('down'); });
+  assert.equal(failing.remoteJidAlt, undefined);
 });

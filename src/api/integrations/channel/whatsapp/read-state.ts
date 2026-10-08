@@ -148,3 +148,24 @@ export async function readRequestToChatAddressing(
       : {}),
   } as ReadMessageDto;
 }
+
+/**
+ * Messages addressed by LID sometimes arrive without remoteJidAlt (history sync
+ * after a fresh pairing, contacts not yet resolved by the server). Without the
+ * phone JID, webhook consumers cannot tell who sent the message. Fill it from
+ * Baileys' LID mapping; leave the key untouched when the mapping is unknown.
+ */
+export async function fillRemoteJidAlt(
+  key: { remoteJid?: string | null; remoteJidAlt?: string | null } | null | undefined,
+  resolvePn: (lid: string) => Promise<string | null | undefined>,
+): Promise<void> {
+  if (!key || typeof key.remoteJid !== 'string' || !key.remoteJid.endsWith('@lid') || key.remoteJidAlt) return;
+  let pn: string | null | undefined;
+  try {
+    pn = await resolvePn(key.remoteJid);
+  } catch {
+    return;
+  }
+  const user = typeof pn === 'string' ? pn.split('@')[0].split(':')[0] : '';
+  if (/^\d{8,15}$/.test(user)) key.remoteJidAlt = `${user}@s.whatsapp.net`;
+}

@@ -159,6 +159,7 @@ import { v4 } from 'uuid';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import {
   chatReadStateUpdates,
+  fillRemoteJidAlt,
   ReadStateValidationError,
   readRequestToChatAddressing,
   resolveReadStateLids,
@@ -1088,6 +1089,8 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          await fillRemoteJidAlt(m.key, (lid) => this.client.signalRepository.lidMapping.getPNForLID(lid));
+
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             if (participantJid && contactsMap.has(participantJid)) {
@@ -1529,6 +1532,7 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          await fillRemoteJidAlt(messageRaw.key, (lid) => this.client.signalRepository.lidMapping.getPNForLID(lid));
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
