@@ -5,6 +5,22 @@ export class ReadStateValidationError extends Error {}
 
 type ReadStateClient = Pick<WASocket, 'readMessages' | 'chatModify'>;
 
+function isGroupJid(jid: unknown): boolean {
+  return typeof jid === 'string' && jid.endsWith('@g.us');
+}
+
+/**
+ * Baileys throws on a group read whose not-from-me key has no participant
+ * (Utils/chat-utils getMessageRange) and aggregates receipts by
+ * `remoteJid:participant` (Utils/messages). Catch it here so the caller gets a
+ * 400 naming the missing field instead of an opaque provider failure.
+ */
+function missingGroupParticipant(key: { remoteJid?: unknown; fromMe?: unknown; participant?: unknown }): boolean {
+  return (
+    isGroupJid(key.remoteJid) && key.fromMe !== true && (typeof key.participant !== 'string' || !key.participant.trim())
+  );
+}
+
 function isChatJid(jid: string): boolean {
   // Baileys' isPnUser/isJidGroup/isLidUser check these suffixes. Keep this
   // predicate local so focused tests need not load the full Baileys runtime.
@@ -32,6 +48,9 @@ export async function syncMessageReadState(client: ReadStateClient, data: ReadMe
     ) {
       throw new ReadStateValidationError('lastMessage requires a valid chat key and epoch-seconds messageTimestamp');
     }
+    if (missingGroupParticipant(key)) {
+      throw new ReadStateValidationError('lastMessage from a group requires key.participant when fromMe is false');
+    }
     if (
       data.readMessages.some(
         (read) =>
@@ -44,13 +63,21 @@ export async function syncMessageReadState(client: ReadStateClient, data: ReadMe
     ) {
       throw new ReadStateValidationError('readMessages and lastMessage must belong to the same chat');
     }
+    if (data.readMessages.some((read) => read && missingGroupParticipant(read))) {
+      throw new ReadStateValidationError('readMessages from a group require participant when fromMe is false');
+    }
   } else if (data.readMessages.length === 0) {
     throw new ReadStateValidationError('readMessages cannot be empty without lastMessage');
   }
 
   const keys: proto.IMessageKey[] = data.readMessages
     .filter((read) => isChatJid(read.remoteJid))
-    .map((read) => ({ remoteJid: read.remoteJid, fromMe: read.fromMe, id: read.id }));
+    .map((read) => ({
+      remoteJid: read.remoteJid,
+      fromMe: read.fromMe,
+      id: read.id,
+      ...(read.participant ? { participant: read.participant } : {}),
+    }));
 
   // Run validation before either external call. A failure in either call propagates to the HTTP request.
   if (lastMessage) {

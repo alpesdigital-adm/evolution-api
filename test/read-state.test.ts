@@ -194,3 +194,70 @@ test('LID-only message keys get the phone JID from the LID mapping', async () =>
   await fillRemoteJidAlt(failing, async () => { throw new Error('down'); });
   assert.equal(failing.remoteJidAlt, undefined);
 });
+
+const groupJid = '120363295648424210@g.us';
+const senderJid = '5511977777777@s.whatsapp.net';
+const groupReceipt = { remoteJid: groupJid, fromMe: false, id: 'group-inbound-1', participant: senderJid };
+const groupLastMessage = { key: groupReceipt, messageTimestamp: 1_790_000_100 };
+
+test('group receipts carry the participant through to the SDK', async () => {
+  const { client, calls } = mockClient();
+  await syncMessageReadState(client, { readMessages: [groupReceipt], lastMessage: groupLastMessage });
+  assert.deepEqual(calls[0], { command: 'chatModify', payload: { markRead: true, lastMessages: [groupLastMessage] }, jid: groupJid });
+  assert.deepEqual(calls[1], { command: 'readMessages', payload: [groupReceipt] });
+});
+
+test('a group key without participant fails before any SDK effect', async () => {
+  const { client, calls } = mockClient();
+  const { participant: _ignored, ...noParticipant } = groupReceipt;
+  await assert.rejects(
+    syncMessageReadState(client, { readMessages: [noParticipant], lastMessage: groupLastMessage }),
+    ReadStateValidationError,
+  );
+  await assert.rejects(
+    syncMessageReadState(client, {
+      readMessages: [groupReceipt],
+      lastMessage: { key: noParticipant, messageTimestamp: groupLastMessage.messageTimestamp },
+    }),
+    ReadStateValidationError,
+  );
+  await assert.rejects(
+    syncMessageReadState(client, {
+      readMessages: [{ ...groupReceipt, participant: '   ' }],
+      lastMessage: groupLastMessage,
+    }),
+    ReadStateValidationError,
+  );
+  assert.deepEqual(calls, []);
+});
+
+test('our own group message needs no participant', async () => {
+  const { client, calls } = mockClient();
+  const mine = { key: { remoteJid: groupJid, fromMe: true, id: 'group-outbound-1' }, messageTimestamp: 1_790_000_101 };
+  await syncMessageReadState(client, { readMessages: [], lastMessage: mine });
+  assert.deepEqual(calls, [{ command: 'chatModify', payload: { markRead: true, lastMessages: [mine] }, jid: groupJid }]);
+});
+
+test('group addressing is left alone: only phone JIDs are mapped to LID', async () => {
+  const addressed = await readRequestToChatAddressing(
+    { readMessages: [groupReceipt], lastMessage: groupLastMessage },
+    async () => '999999999999@lid',
+  );
+  assert.equal(addressed.readMessages[0].remoteJid, groupJid);
+  assert.equal(addressed.readMessages[0].participant, senderJid);
+  assert.equal(addressed.lastMessage?.key.remoteJid, groupJid);
+});
+
+test('request schema accepts the participant on both keys', () => {
+  const validator = new Validator();
+  const valid = (value: unknown) => validator.validate(value, readMessageSchema).valid;
+  assert.equal(valid({ readMessages: [groupReceipt], lastMessage: groupLastMessage }), true);
+  assert.equal(valid({ readMessages: [{ ...groupReceipt, participant: '' }] }), false);
+});
+
+test('a legacy receipts-only group request is not forced to carry the participant', async () => {
+  const { client, calls } = mockClient();
+  const { participant: _ignored, ...noParticipant } = groupReceipt;
+  await syncMessageReadState(client, { readMessages: [noParticipant] });
+  assert.deepEqual(calls, [{ command: 'readMessages', payload: [noParticipant] }]);
+});
