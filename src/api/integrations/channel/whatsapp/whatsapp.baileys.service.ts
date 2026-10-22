@@ -156,12 +156,17 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
+import { AppStateSelfHealer, createSocketHealTarget, watchAppStateFailures } from './app-state-self-heal';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import {
+  buildGroupReadSelfPayload,
   chatReadStateUpdates,
+  collectGroupReadSelf,
   fillRemoteJidAlt,
-  ReadStateValidationError,
+  ownAccountJids,
+  pickLatestMessageId,
   readRequestToChatAddressing,
+  ReadStateValidationError,
   resolveReadStateLids,
   syncMessageReadState,
   toChatAddressingJid,
@@ -270,6 +275,20 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // Survives reconnects (the socket is rebuilt each time) so cooldown/attempt limits hold.
+  private appStateHealer?: AppStateSelfHealer;
+
+  private getAppStateHealer(): AppStateSelfHealer {
+    this.appStateHealer ??= new AppStateSelfHealer({
+      instanceName: this.instance.name,
+      log: this.logger,
+      getTarget: () =>
+        this.client
+          ? createSocketHealTarget(this.client, () => !this.endSession && this.stateConnection?.state === 'open')
+          : undefined,
+    });
+    return this.appStateHealer;
+  }
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -452,6 +471,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
+      this.appStateHealer?.stop();
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       // If a stream:error 515 (Baileys' "restart needed" handshake) just fired,
@@ -685,7 +705,10 @@ export class BaileysStartupService extends ChannelStartupService {
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
-      logger: P({ level: this.logBaileys }),
+      // Watches Baileys' warnings for an app-state LTHash mismatch (see app-state-self-heal.ts).
+      logger: watchAppStateFailures(P({ level: this.logBaileys }), (failure) => {
+        this.getAppStateHealer().report(failure);
+      }),
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
@@ -748,6 +771,7 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+    this.getAppStateHealer().start();
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -2003,6 +2027,8 @@ export class BaileysStartupService extends ChannelStartupService {
                   this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
                 ),
               );
+
+              await this.forwardGroupReadSelf(payload, settings);
             }
 
             if (events['presence.update']) {
@@ -4861,6 +4887,45 @@ export class BaileysStartupService extends ChannelStartupService {
         this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
       });
       task.start();
+    }
+  }
+
+  /**
+   * The phone reading a group arrives as a receipt whose reader is our own account.
+   * Unlike 1:1 chats (messages.update), Baileys emits no messages.update for it, so
+   * forward it as the same MESSAGES_UPDATE READ webhook, once per group per batch,
+   * for the newest message of the batch.
+   */
+  private async forwardGroupReadSelf(updates: MessageUserReceiptUpdate[], settings: any): Promise<void> {
+    try {
+      const own = ownAccountJids(this.client?.user);
+      for (const group of collectGroupReadSelf(updates, own, { groupsIgnore: settings?.groupsIgnore })) {
+        const keyId = await pickLatestMessageId(group.ids, async (ids) => {
+          const rows = (await this.prismaRepository.$queryRaw`
+            SELECT "key"->>'id' AS "id", "messageTimestamp" AS "ts" FROM "Message"
+            WHERE "instanceId" = ${this.instanceId}
+            AND "key"->>'remoteJid' = ${group.remoteJid}
+            AND "key"->>'id' = ANY(${ids})
+          `) as { id: string; ts: number | bigint | null }[];
+          return Object.fromEntries(rows.map((row) => [row.id, row.ts === null ? null : Number(row.ts)]));
+        });
+
+        const dedupKey = `${this.instance.id}_${keyId}_READ_SELF`;
+        if (await this.baileysCache.get(dedupKey)) continue;
+        await this.baileysCache.set(dedupKey, true, this.UPDATE_CACHE_TTL_SECONDS);
+
+        this.sendDataWebhook(
+          Events.MESSAGES_UPDATE,
+          buildGroupReadSelfPayload({
+            keyId,
+            remoteJid: group.remoteJid,
+            instanceId: this.instanceId,
+            readTimestamp: group.readTimestamp,
+          }),
+        );
+      }
+    } catch (error) {
+      this.logger.error(`group read-self forward failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

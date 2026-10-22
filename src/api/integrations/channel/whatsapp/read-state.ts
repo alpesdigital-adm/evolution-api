@@ -157,7 +157,8 @@ export async function readRequestToChatAddressing(
 ): Promise<ReadMessageDto> {
   const jids = new Set<string>();
   if (data.lastMessage?.key?.remoteJid) jids.add(data.lastMessage.key.remoteJid);
-  if (Array.isArray(data.readMessages)) for (const read of data.readMessages) if (read?.remoteJid) jids.add(read.remoteJid);
+  if (Array.isArray(data.readMessages))
+    for (const read of data.readMessages) if (read?.remoteJid) jids.add(read.remoteJid);
   const mapped = new Map<string, string>();
   for (const jid of jids) mapped.set(jid, await toChatAddressingJid(jid, resolveLid));
   return {
@@ -169,7 +170,10 @@ export async function readRequestToChatAddressing(
       ? {
           lastMessage: {
             ...data.lastMessage,
-            key: { ...data.lastMessage.key, remoteJid: mapped.get(data.lastMessage.key.remoteJid) ?? data.lastMessage.key.remoteJid },
+            key: {
+              ...data.lastMessage.key,
+              remoteJid: mapped.get(data.lastMessage.key.remoteJid) ?? data.lastMessage.key.remoteJid,
+            },
           },
         }
       : {}),
@@ -195,4 +199,116 @@ export async function fillRemoteJidAlt(
   }
   const user = typeof pn === 'string' ? pn.split('@')[0].split(':')[0] : '';
   if (/^\d{8,15}$/.test(user)) key.remoteJidAlt = `${user}@s.whatsapp.net`;
+}
+
+/** `5511999999999:12@s.whatsapp.net` and `5511999999999@c.us` → `5511999999999@s.whatsapp.net`; LIDs keep their server. */
+export function normalizeAccountJid(jid: unknown): string | null {
+  if (typeof jid !== 'string') return null;
+  const at = jid.lastIndexOf('@');
+  if (at <= 0) return null;
+  const user = jid.slice(0, at).split(':')[0].split('_')[0];
+  const server = jid.slice(at + 1) === 'c.us' ? 's.whatsapp.net' : jid.slice(at + 1);
+  return user && server ? `${user}@${server}` : null;
+}
+
+/** The instance's own account in every addressing mode (phone JID and LID), device suffix stripped. */
+export function ownAccountJids(user: { id?: string | null; lid?: string | null } | null | undefined): Set<string> {
+  const own = new Set<string>();
+  for (const jid of [user?.id, user?.lid]) {
+    const normalized = normalizeAccountJid(jid);
+    if (normalized) own.add(normalized);
+  }
+  return own;
+}
+
+export type ReceiptUpdateLike = {
+  key?: { remoteJid?: string | null; id?: string | null } | null;
+  receipt?: { userJid?: string | null; readTimestamp?: unknown } | null;
+};
+
+export type GroupReadSelf = { remoteJid: string; ids: string[]; readTimestamp: number };
+
+/**
+ * Baileys reports a group receipt as `message-receipt.update` with
+ * `receipt.userJid` = whoever read (messages-recv.js handleReceipt: the node's
+ * `participant`). `key.participant` is that same reader and `key.fromMe` is
+ * always true there, so neither says who wrote the message. A read by the
+ * instance's own account is the phone reading the group (read-self); a read by
+ * anyone else is a participant reading OUR message and must not be reported as ours.
+ */
+export function collectGroupReadSelf(
+  updates: ReceiptUpdateLike[],
+  own: Set<string>,
+  opts: { groupsIgnore?: boolean } = {},
+): GroupReadSelf[] {
+  if (opts.groupsIgnore || own.size === 0) return [];
+  const byGroup = new Map<string, GroupReadSelf>();
+  for (const update of updates) {
+    const remoteJid = update?.key?.remoteJid;
+    const id = update?.key?.id;
+    const readTimestamp = update?.receipt?.readTimestamp;
+    if (typeof remoteJid !== 'string' || !remoteJid.endsWith('@g.us')) continue;
+    if (typeof id !== 'string' || !id || typeof readTimestamp !== 'number' || !Number.isFinite(readTimestamp)) continue;
+    const reader = normalizeAccountJid(update?.receipt?.userJid);
+    if (!reader || !own.has(reader)) continue;
+
+    const entry = byGroup.get(remoteJid) ?? { remoteJid, ids: [], readTimestamp };
+    if (!entry.ids.includes(id)) entry.ids.push(id);
+    entry.readTimestamp = Math.max(entry.readTimestamp, readTimestamp);
+    byGroup.set(remoteJid, entry);
+  }
+  return [...byGroup.values()];
+}
+
+/**
+ * One webhook per group is enough: the consumer clears the group's unread up to
+ * the message it is given. A receipt lists many ids with no order guarantee, so
+ * when a resolver for message timestamps is available the newest stored message
+ * wins; otherwise (or on any resolver failure) the last id listed is used.
+ */
+export async function pickLatestMessageId(
+  ids: string[],
+  resolveTimestamps?: (ids: string[]) => Promise<Record<string, number | null | undefined>>,
+): Promise<string> {
+  const last = ids[ids.length - 1];
+  if (ids.length < 2 || !resolveTimestamps) return last;
+  try {
+    const candidates = ids.slice(-200);
+    const stamps = await resolveTimestamps(candidates);
+    let best = last;
+    let bestStamp = -Infinity;
+    for (const id of candidates) {
+      const raw = stamps?.[id];
+      if (raw === null || raw === undefined) continue; // Number(null) would read as timestamp 0
+      const stamp = Number(raw);
+      if (Number.isFinite(stamp) && stamp >= bestStamp) {
+        best = id;
+        bestStamp = stamp;
+      }
+    }
+    return bestStamp === -Infinity ? last : best;
+  } catch {
+    return last;
+  }
+}
+
+/** Same shape the `messages.update` handler sends for a status change (consumed as MESSAGES_UPDATE). */
+export function buildGroupReadSelfPayload(input: {
+  keyId: string;
+  remoteJid: string;
+  instanceId: string;
+  readTimestamp: number;
+  messageId?: string;
+}) {
+  return {
+    keyId: input.keyId,
+    remoteJid: input.remoteJid,
+    fromMe: false,
+    participant: undefined,
+    status: 'READ',
+    pollUpdates: undefined,
+    instanceId: input.instanceId,
+    ...(input.messageId ? { messageId: input.messageId } : {}),
+    readTimestamp: input.readTimestamp,
+  };
 }
