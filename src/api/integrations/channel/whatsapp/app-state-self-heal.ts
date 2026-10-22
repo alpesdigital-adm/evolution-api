@@ -12,8 +12,17 @@
  * The cure is the one we applied by hand: drop `app-state-sync-version-<name>`
  * so the next resync starts at v0 and asks the server for a full snapshot.
  *
+ * A resync from v0 has no minimum version, so Baileys (processSyncAction, not an
+ * initial sync) re-emits EVERY record of the snapshot as a live event: stale
+ * read/unread markers become chats.update unreadCount 0/-1 "observed now",
+ * regular_high replays chats.delete / messages.delete for every chat or message
+ * ever deleted. Those replayed chat/message events are dropped (see
+ * suppressHealReplay); the state itself is still rebuilt.
+ *
  * This module has no Baileys runtime import so it can be unit-tested alone.
  */
+
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 export const APP_STATE_COLLECTIONS = [
   'critical_block',
@@ -77,13 +86,20 @@ export function watchAppStateFailures<T extends object>(logger: T, onFailure: (f
   });
 }
 
+/** Stored LTHash state of a collection (opaque here: only `version` is read, the rest is written back as is). */
+export type StoredAppState = { version?: number };
+
 export interface AppStateHealTarget {
   /** True only while the socket is open; the heal never runs otherwise. */
   isOpen(): boolean;
   /** Stored version of the collection, undefined when nothing is stored. */
   readVersion(name: AppStateCollection): Promise<number | undefined>;
+  /** Stored state of the collection, undefined when nothing is stored. */
+  readState(name: AppStateCollection): Promise<StoredAppState | undefined>;
   /** Removes the stored version (through the socket's key store, so its in-memory cache is cleared too). */
   clearVersion(name: AppStateCollection): Promise<void>;
+  /** Puts `state` back only if nothing is stored now; true when it did. */
+  restoreIfEmpty(name: AppStateCollection, state: StoredAppState): Promise<boolean>;
   /** Runs Baileys' resyncAppState([name], false). */
   resync(name: AppStateCollection): Promise<void>;
 }
@@ -96,8 +112,8 @@ export interface AppStateSocketLike {
       get(
         type: 'app-state-sync-version',
         ids: string[],
-      ): MaybePromise<Record<string, { version?: number } | null | undefined>>;
-      set(data: { 'app-state-sync-version': Record<string, null> }): MaybePromise<void>;
+      ): MaybePromise<Record<string, StoredAppState | null | undefined>>;
+      set(data: { 'app-state-sync-version'?: Record<string, StoredAppState | null> }): MaybePromise<void>;
       transaction<T>(work: () => Promise<T>, key: string): Promise<T>;
     };
   };
@@ -114,16 +130,79 @@ type MaybePromise<T> = T | PromiseLike<T>;
  */
 export function createSocketHealTarget(socket: AppStateSocketLike, isOpen: () => boolean): AppStateHealTarget {
   const { keys, creds } = socket.authState;
+  const txKey = () => creds?.me?.id || 'resync-app-state';
+  const read = async (name: AppStateCollection) =>
+    (await keys.get('app-state-sync-version', [name]))?.[name] ?? undefined;
   return {
     isOpen,
-    readVersion: async (name) => (await keys.get('app-state-sync-version', [name]))?.[name]?.version,
+    readVersion: async (name) => (await read(name))?.version,
+    readState: read,
     clearVersion: async (name) => {
       await keys.transaction(async () => {
         await keys.set({ 'app-state-sync-version': { [name]: null } });
-      }, creds?.me?.id || 'resync-app-state');
+      }, txKey());
     },
+    restoreIfEmpty: (name, state) =>
+      keys.transaction(async () => {
+        if (await read(name)) return false;
+        await keys.set({ 'app-state-sync-version': { [name]: state } });
+        return true;
+      }, txKey()),
     resync: (name) => socket.resyncAppState([name], false),
   };
+}
+
+/**
+ * Chat/message events a snapshot replay would re-emit as if they were new.
+ * creds.update, contacts, labels and settings are left alone (current state,
+ * idempotent for consumers).
+ */
+export const HEAL_REPLAY_SUPPRESSED_EVENTS: ReadonlySet<string> = new Set([
+  'chats.update',
+  'chats.delete',
+  'chats.lock',
+  'messages.update',
+  'messages.delete',
+]);
+
+type HealReplayScope = { active: boolean; suppressed: number };
+const healReplayScope = new AsyncLocalStorage<HealReplayScope>();
+const REPLAY_GUARD = Symbol.for('evolution.appStateHealReplayGuard');
+
+type EmitterLike = { emit: (event: any, ...args: any[]) => any };
+
+/**
+ * Drops the events listed above when they are emitted from inside a self-heal
+ * resync (tracked with AsyncLocalStorage, so live events emitted concurrently by
+ * other nodes pass untouched). Install once per socket on `socket.ev`: Baileys'
+ * processSyncAction emits through that same object.
+ */
+export function suppressHealReplay<T extends EmitterLike>(ev: T): T {
+  const marked = ev as T & { [REPLAY_GUARD]?: boolean };
+  if (marked[REPLAY_GUARD]) return ev;
+  const emit = ev.emit;
+  ev.emit = function (this: unknown, event: unknown, ...args: unknown[]) {
+    const scope = healReplayScope.getStore();
+    if (scope?.active && typeof event === 'string' && HEAL_REPLAY_SUPPRESSED_EVENTS.has(event)) {
+      scope.suppressed += 1;
+      return false;
+    }
+    return emit.call(this ?? ev, event, ...args);
+  } as T['emit'];
+  marked[REPLAY_GUARD] = true;
+  return ev;
+}
+
+/** Runs `work` as a self-heal replay; returns how many events were suppressed. */
+export async function runAsHealReplay(work: () => Promise<void>): Promise<number> {
+  const scope: HealReplayScope = { active: true, suppressed: 0 };
+  try {
+    await healReplayScope.run(scope, work);
+  } finally {
+    // Timers created inside (Baileys' buffer flush) inherit the store; they must not suppress anything.
+    scope.active = false;
+  }
+  return scope.suppressed;
 }
 
 type HealLog = { warn: (msg: string) => void; error: (msg: string) => void };
@@ -226,21 +305,42 @@ export class AppStateSelfHealer {
     recent.push(now);
     this.attempts.set(name, recent);
 
+    let previous: StoredAppState | undefined;
+    let cleared = false;
+    let failure: string | undefined;
     try {
-      const oldVersion = (await target.readVersion(name)) ?? reportedVersion;
+      previous = await target.readState(name);
+      const oldVersion = previous?.version ?? reportedVersion;
       log.warn(`app-state self-heal: ${instanceName} ${name} v${oldVersion ?? '?'} → snapshot`);
       await target.clearVersion(name);
-      await target.resync(name);
-      const newVersion = await target.readVersion(name);
-      if (newVersion === undefined) {
-        log.error(`app-state self-heal: ${instanceName} ${name} FAILED (no state stored after resync)`);
-      } else {
-        log.warn(`app-state self-heal: ${instanceName} ${name} OK (snapshot restored at v${newVersion})`);
+      cleared = true;
+      const suppressed = await runAsHealReplay(() => target.resync(name));
+      if (suppressed > 0) {
+        log.warn(`app-state self-heal: ${instanceName} ${name} suppressed ${suppressed} replayed chat/message events`);
       }
+      const newVersion = await target.readVersion(name);
+      if (newVersion !== undefined) {
+        log.warn(`app-state self-heal: ${instanceName} ${name} OK (snapshot restored at v${newVersion})`);
+        return;
+      }
+      failure = 'no state stored after resync';
     } catch (error) {
-      log.error(
-        `app-state self-heal: ${instanceName} ${name} FAILED (${error instanceof Error ? error.message : String(error)})`,
-      );
+      failure = error instanceof Error ? error.message : String(error);
     }
+
+    // Leaving the collection cleared would let the next ordinary resync replay the
+    // whole snapshot unguarded; the previous (mismatching) state is the lesser evil.
+    let restored = false;
+    if (cleared && previous) {
+      try {
+        restored = await target.restoreIfEmpty(name, previous);
+      } catch {
+        // reported below as not restored
+      }
+    }
+    log.error(
+      `app-state self-heal: ${instanceName} ${name} FAILED (${failure})` +
+        (restored ? `; previous state v${previous?.version ?? '?'} restored` : ''),
+    );
   }
 }

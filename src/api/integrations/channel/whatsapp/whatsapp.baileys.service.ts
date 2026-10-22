@@ -156,7 +156,12 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
-import { AppStateSelfHealer, createSocketHealTarget, watchAppStateFailures } from './app-state-self-heal';
+import {
+  AppStateSelfHealer,
+  createSocketHealTarget,
+  suppressHealReplay,
+  watchAppStateFailures,
+} from './app-state-self-heal';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import {
   buildGroupReadSelfPayload,
@@ -771,6 +776,8 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+    // A self-heal snapshot replays every record as a live event (stale reads, old deletes): drop those.
+    suppressHealReplay(this.client.ev);
     this.getAppStateHealer().start();
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {

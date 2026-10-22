@@ -1,16 +1,28 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { EventEmitter } from 'node:events';
+
 import {
   AppStateSelfHealer,
   createSocketHealTarget,
   LTHASH_PATCH_FAILURE_MSG,
   parseLtHashPatchFailure,
+  runAsHealReplay,
+  suppressHealReplay,
   watchAppStateFailures,
   type AppStateCollection,
   type AppStateHealTarget,
 } from '../src/api/integrations/channel/whatsapp/app-state-self-heal';
 
-function fakeTarget(opts: { open?: boolean; failResync?: boolean; versions?: Record<string, number | undefined> } = {}) {
+function fakeTarget(
+  opts: {
+    open?: boolean;
+    failResync?: boolean;
+    storeNothing?: boolean;
+    versions?: Record<string, number | undefined>;
+    onResync?: () => void;
+  } = {},
+) {
   const calls: string[] = [];
   const versions: Record<string, number | undefined> = { regular_low: 108, ...(opts.versions ?? {}) };
   const target: AppStateHealTarget & { open: boolean } = {
@@ -21,14 +33,24 @@ function fakeTarget(opts: { open?: boolean; failResync?: boolean; versions?: Rec
     async readVersion(name) {
       return versions[name];
     },
+    async readState(name) {
+      return versions[name] === undefined ? undefined : { version: versions[name] };
+    },
     async clearVersion(name) {
       calls.push(`clear:${name}`);
       versions[name] = undefined; // keys.set(null)
     },
+    async restoreIfEmpty(name, state) {
+      if (versions[name] !== undefined) return false;
+      calls.push(`restore:${name}:v${state.version}`);
+      versions[name] = state.version;
+      return true;
+    },
     async resync(name) {
       calls.push(`resync:${name}`);
+      opts.onResync?.();
       if (opts.failResync) throw new Error('boom');
-      versions[name] = 215; // snapshot restored
+      if (!opts.storeNothing) versions[name] = 215; // snapshot restored
     },
   };
   return { target, calls, versions };
@@ -189,17 +211,113 @@ test('at most 3 attempts per hour per collection', async () => {
 });
 
 test('a failing resync is logged as an error, not thrown, and still counts as an attempt', async () => {
-  const { target, calls } = fakeTarget({ failResync: true });
+  const { target, calls, versions } = fakeTarget({ failResync: true });
   let now = 1;
   const { h, lines } = healer(target, { now: () => now });
   h.report({ name: 'regular_low', version: 108 });
   await h.flush();
-  assert.ok(lines.some((l) => /^ERROR app-state self-heal: Leandro regular_low FAILED \(boom\)$/.test(l)));
+  assert.ok(
+    lines.some((l) =>
+      /^ERROR app-state self-heal: Leandro regular_low FAILED \(boom\); previous state v108 restored$/.test(l),
+    ),
+  );
+  // Never left cleared: an ordinary resync from v0 would replay the whole snapshot unguarded.
+  assert.equal(versions.regular_low, 108);
 
   now += 1000;
   h.report({ name: 'regular_low', version: 109 });
   await h.flush();
   assert.equal(calls.filter((c) => c.startsWith('resync')).length, 1); // cooldown
+});
+
+test('a resync that stores nothing (e.g. collection parked on a missing key) restores the previous state', async () => {
+  const { target, calls, versions } = fakeTarget({ storeNothing: true });
+  const { h, lines } = healer(target);
+  h.report({ name: 'regular_low', version: 108 });
+  await h.flush();
+  assert.deepEqual(calls, ['clear:regular_low', 'resync:regular_low', 'restore:regular_low:v108']);
+  assert.equal(versions.regular_low, 108);
+  assert.ok(lines.some((l) => /FAILED \(no state stored after resync\); previous state v108 restored$/.test(l)));
+});
+
+test('the previous state is not restored over a state another resync stored meanwhile', async () => {
+  const { target, calls, versions } = fakeTarget({ failResync: true });
+  target.resync = async (name) => {
+    calls.push(`resync:${name}`);
+    versions[name] = 300; // an ordinary resync won the mutex and stored a fresh snapshot
+    throw new Error('timed out');
+  };
+  const { h, lines } = healer(target);
+  h.report({ name: 'regular_low', version: 108 });
+  await h.flush();
+  assert.equal(versions.regular_low, 300);
+  assert.ok(!calls.some((c) => c.startsWith('restore')));
+  assert.ok(lines.some((l) => /FAILED \(timed out\)$/.test(l)));
+});
+
+test('replay guard: chat/message events emitted inside a heal resync are dropped, live ones pass', async () => {
+  const delivered: string[] = [];
+  const ev = suppressHealReplay({
+    emit(event: string, data: unknown) {
+      delivered.push(`${event}:${JSON.stringify(data)}`);
+      return true;
+    },
+  });
+  suppressHealReplay(ev); // idempotent: a second install must not double-wrap
+
+  let timerEmit: Promise<void> | undefined;
+  const suppressed = await runAsHealReplay(async () => {
+    await Promise.resolve();
+    ev.emit('chats.update', [{ id: 'g@g.us', unreadCount: 0 }]); // stale read marker
+    ev.emit('chats.delete', ['old@s.whatsapp.net']); // chat deleted months ago
+    ev.emit('messages.delete', { keys: [] });
+    ev.emit('creds.update', { me: { name: 'x' } }); // not a chat/message replay
+    // A timer started inside (Baileys' buffer flush) runs after the heal: not suppressed.
+    timerEmit = new Promise((resolve) =>
+      setTimeout(() => {
+        ev.emit('chats.update', [{ id: 'after@s.whatsapp.net', unreadCount: 1 }]);
+        resolve();
+      }, 5),
+    );
+  });
+  ev.emit('chats.update', [{ id: 'live@s.whatsapp.net', unreadCount: 0 }]); // outside the heal
+  await timerEmit;
+
+  assert.equal(suppressed, 3);
+  assert.deepEqual(delivered, [
+    'creds.update:{"me":{"name":"x"}}',
+    'chats.update:[{"id":"live@s.whatsapp.net","unreadCount":0}]',
+    'chats.update:[{"id":"after@s.whatsapp.net","unreadCount":1}]',
+  ]);
+});
+
+test('replay guard on a real EventEmitter keeps `this` and listeners working', async () => {
+  const emitter = new EventEmitter();
+  const got: string[] = [];
+  emitter.on('chats.update', (d) => got.push(JSON.stringify(d)));
+  suppressHealReplay(emitter);
+  await runAsHealReplay(async () => {
+    emitter.emit('chats.update', [{ id: 'replayed' }]);
+  });
+  emitter.emit('chats.update', [{ id: 'live' }]);
+  assert.deepEqual(got, ['[{"id":"live"}]']);
+});
+
+test('heal: replayed events of the snapshot are suppressed and counted in the log', async () => {
+  const delivered: string[] = [];
+  const ev = suppressHealReplay({ emit: (event: string) => delivered.push(event) > 0 });
+  const { target } = fakeTarget({
+    onResync: () => {
+      ev.emit('chats.update', [{ id: 'a', unreadCount: 0 }]);
+      ev.emit('chats.update', [{ id: 'b', unreadCount: -1 }]);
+    },
+  });
+  const { h, lines } = healer(target);
+  h.report({ name: 'regular_low', version: 108 });
+  await h.flush();
+  assert.deepEqual(delivered, []);
+  assert.ok(lines.some((l) => /regular_low suppressed 2 replayed chat\/message events$/.test(l)));
+  assert.ok(lines.some((l) => /regular_low OK \(snapshot restored at v215\)$/.test(l)));
 });
 
 test('healers of two instances are fully independent', async () => {
@@ -263,4 +381,40 @@ test('socket target: version is cleared with null through the key store inside a
     'set:{"app-state-sync-version":{"regular_low":null}}:tx=true',
     'resync:["regular_low"]:false',
   ]);
+});
+
+test('socket target: restoreIfEmpty writes back inside the same-key transaction only when nothing is stored', async () => {
+  const store: Record<string, unknown> = { regular_low: { version: 109, hash: 'h' } };
+  const events: string[] = [];
+  const socket = {
+    authState: {
+      creds: { me: { id: '5511999999999:12@s.whatsapp.net' } },
+      keys: {
+        async get(_type: string, ids: string[]) {
+          return Object.fromEntries(ids.map((id) => [id, store[id] ?? null]));
+        },
+        async set(data: { 'app-state-sync-version': Record<string, unknown> }) {
+          Object.assign(store, data['app-state-sync-version']);
+          events.push(`set:${JSON.stringify(data)}`);
+        },
+        async transaction<T>(work: () => Promise<T>, key: string) {
+          events.push(`tx:${key}`);
+          return work();
+        },
+      },
+    },
+    async resyncAppState() {},
+  };
+  const target = createSocketHealTarget(socket as never, () => true);
+  const previous = await target.readState('regular_low');
+  assert.deepEqual(previous, { version: 109, hash: 'h' });
+
+  assert.equal(await target.restoreIfEmpty('regular_low', { version: 1 }), false); // something stored: untouched
+  assert.deepEqual(store.regular_low, { version: 109, hash: 'h' });
+
+  await target.clearVersion('regular_low');
+  assert.equal(await target.readState('regular_low'), undefined);
+  assert.equal(await target.restoreIfEmpty('regular_low', previous!), true);
+  assert.deepEqual(store.regular_low, { version: 109, hash: 'h' });
+  assert.ok(events.every((e) => !e.startsWith('tx:') || e === 'tx:5511999999999:12@s.whatsapp.net'));
 });
