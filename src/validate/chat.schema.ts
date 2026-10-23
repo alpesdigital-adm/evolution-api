@@ -38,6 +38,10 @@ export const whatsappNumberSchema: JSONSchema7 = {
         description: '"numbers" must be an array of numeric strings',
       },
     },
+    includeLid: {
+      type: 'boolean',
+      description: '"includeLid" must be a boolean',
+    },
   },
 };
 

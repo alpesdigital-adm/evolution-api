@@ -163,6 +163,7 @@ import {
   watchAppStateFailures,
 } from './app-state-self-heal';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { attachLids } from './numbers-lid';
 import {
   buildGroupReadSelfPayload,
   chatReadStateUpdates,
@@ -3770,6 +3771,14 @@ export class BaileysStartupService extends ChannelStartupService {
           lid: user.lid === 'lid' ? 'lid' : undefined,
         })),
       );
+    }
+
+    // Opt-in only: the default response shape must not change for existing callers.
+    // Runs after the cache write so the real LID never leaks into IsOnWhatsapp.lid (a 'lid' marker there).
+    if (data.includeLid === true) {
+      return await attachLids(onWhatsapp, (pns) => this.client.signalRepository.lidMapping.getLIDsForPNs(pns), {
+        warn: (message) => this.logger.warn(message),
+      });
     }
 
     return onWhatsapp;

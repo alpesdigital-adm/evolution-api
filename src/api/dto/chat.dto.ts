@@ -24,6 +24,8 @@ export class getBase64FromMediaMessageDto {
 
 export class WhatsAppNumberDto {
   numbers: string[];
+  /** Opt-in: add each confirmed number's WhatsApp LID (`<digits>@lid` or null) to the response. */
+  includeLid?: boolean;
 }
 
 export class NumberDto {
