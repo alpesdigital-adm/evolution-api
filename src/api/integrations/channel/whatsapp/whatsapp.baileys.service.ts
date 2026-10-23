@@ -176,6 +176,7 @@ import {
   syncMessageReadState,
   toChatAddressingJid,
 } from './read-state';
+import { attachStatusAck } from './status-ack';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -779,6 +780,8 @@ export class BaileysStartupService extends ChannelStartupService {
     // A self-heal snapshot replays every record as a live event (stale reads, old deletes): drop those.
     suppressHealReplay(this.client.ev);
     this.getAppStateHealer().start();
+    // Baileys never acks the top-level <status> stanza: the server drops the stream ~50 min later (Baileys#2858).
+    attachStatusAck(this.client as any, (error) => this.logger.warn(`status ack failed: ${String(error)}`));
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
