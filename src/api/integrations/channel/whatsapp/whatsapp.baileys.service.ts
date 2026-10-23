@@ -781,7 +781,9 @@ export class BaileysStartupService extends ChannelStartupService {
     suppressHealReplay(this.client.ev);
     this.getAppStateHealer().start();
     // Baileys never acks the top-level <status> stanza: the server drops the stream ~50 min later (Baileys#2858).
-    attachStatusAck(this.client as any, (error) => this.logger.warn(`status ack failed: ${String(error)}`));
+    if (!attachStatusAck(this.client as any, (error) => this.logger.warn(`status ack failed: ${String(error)}`))) {
+      this.logger.info('Baileys already handles CB:status: status-ack.ts is no longer needed');
+    }
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);

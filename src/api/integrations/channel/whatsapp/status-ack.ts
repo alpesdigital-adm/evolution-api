@@ -34,7 +34,10 @@ export interface StatusAckStanza {
 }
 
 export interface StatusAckSocket {
-  ws: { on(event: string, listener: (node: StatusAckNode) => void): unknown };
+  ws: {
+    on(event: string, listener: (node: StatusAckNode) => void): unknown;
+    listenerCount?(event: string): number;
+  };
   sendNode(stanza: StatusAckStanza): Promise<unknown>;
 }
 
@@ -53,11 +56,24 @@ export function buildStatusAckStanza(node: StatusAckNode): StatusAckStanza | nul
   return stanza;
 }
 
-/** Acks every incoming `<status>` stanza, live or offline. Never throws. */
-export function attachStatusAck(socket: StatusAckSocket, onError: (error: unknown) => void): void {
+/**
+ * Acks every incoming `<status>` stanza, live or offline. Never throws.
+ *
+ * Call it right after makeWASocket. It does nothing and returns false when the socket
+ * already has a `CB:status` listener: a Baileys release with #2866 registers one inside
+ * makeWASocket and acks the stanza itself, so registering ours would ack it twice.
+ */
+export function attachStatusAck(socket: StatusAckSocket, onError: (error: unknown) => void): boolean {
+  if (socket.ws.listenerCount?.('CB:status')) return false;
   socket.ws.on('CB:status', (node) => {
-    const stanza = buildStatusAckStanza(node);
-    if (!stanza) return;
-    socket.sendNode(stanza).catch(onError);
+    try {
+      const stanza = buildStatusAckStanza(node);
+      if (!stanza) return;
+      // Baileys' sendNode encodes synchronously before returning the send promise.
+      socket.sendNode(stanza).catch(onError);
+    } catch (error) {
+      onError(error);
+    }
   });
+  return true;
 }

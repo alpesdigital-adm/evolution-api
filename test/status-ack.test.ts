@@ -90,3 +90,31 @@ test('a failing send is reported and never throws out of the listener', async ()
   await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(errors, [boom]);
 });
+
+test('a sendNode that throws synchronously (Baileys encodes before the promise) is reported too', () => {
+  const ws = new EventEmitter();
+  const boom = new Error('encode failed');
+  const errors: unknown[] = [];
+  const socket = {
+    ws,
+    sendNode: (() => {
+      throw boom;
+    }) as (s: StatusAckStanza) => Promise<unknown>,
+  };
+  assert.equal(attachStatusAck(socket, (e) => errors.push(e)), true);
+
+  assert.doesNotThrow(() => ws.emit('CB:status', statusNode));
+  assert.deepEqual(errors, [boom]);
+});
+
+test('does not register a second ack when Baileys already listens to CB:status (no double ack)', () => {
+  const ws = new EventEmitter();
+  const sent: StatusAckStanza[] = [];
+  ws.on('CB:status', () => undefined); // what a Baileys release with #2866 registers inside makeWASocket
+  const socket = { ws, sendNode: async (s: StatusAckStanza) => sent.push(s) };
+
+  assert.equal(attachStatusAck(socket, () => assert.fail('no error expected')), false);
+  ws.emit('CB:status', statusNode);
+  assert.equal(ws.listenerCount('CB:status'), 1);
+  assert.deepEqual(sent, []);
+});
