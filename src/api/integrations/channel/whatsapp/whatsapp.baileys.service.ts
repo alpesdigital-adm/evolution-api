@@ -619,9 +619,9 @@ export class BaileysStartupService extends ChannelStartupService {
       if (!fullMsg?.message) {
         throw new BadRequestException('Message not found');
       }
-      const number = data.number.replace(/\D/g, '');
-      const jid = data.number.includes('@') ? data.number : `${number}@s.whatsapp.net`;
-      return await this.client.sendMessage(jid, { forward: fullMsg });
+      // Resolve PN JIDs through the normal WhatsApp lookup; group/LID addresses stay opaque.
+      const number = data.number.replace(/^(\d+)@s\.whatsapp\.net$/, '$1');
+      return await this.sendMessageWithTyping<AnyMessageContent>(number, { forward: fullMsg, force: true });
     } catch (error) {
       throw new BadRequestException('Error forwarding message', error.toString());
     }
@@ -2257,6 +2257,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // NOTE: NÃO DEVEMOS GERAR O messageId AQUI, SOMENTE SE VIER INFORMADO POR PARAMETRO. A GERAÇÃO ANTERIOR IMPEDE O WZAP DE IDENTIFICAR A SOURCE.
     if (messageId) option.messageId = messageId;
+
+    // Native forwards already contain a complete WAMessage, including media references.
+    // Do not wrap them in another forward or overwrite their original contextInfo.
+    if (message['forward']) {
+      return await this.client.sendMessage(sender, message as AnyMessageContent, option);
+    }
 
     if (message['viewOnceMessage']) {
       const m = generateWAMessageFromContent(sender, message, {
