@@ -402,3 +402,38 @@ test('group read-self payload has the messages.update status shape the CRM parse
   assert.equal(payload.fromMe, false);
   assert.equal(payload.status, 'READ');
 });
+
+test('grupo preserva intervalo completo e participantes PN/LID até o SDK', async () => {
+  const range = [
+    { key: { remoteJid: groupJid, id: 'grupo-enviada', fromMe: true, participant: senderJid }, messageTimestamp: 1_790_000_101 },
+    { key: { remoteJid: groupJid, id: 'grupo-recebida', fromMe: false, participant: '12345678901234@lid' }, messageTimestamp: 1_790_000_100 },
+  ];
+  let resolved = 0;
+  const addressed = await readRequestToChatAddressing({ readMessages: [range[1].key], lastMessages: range }, async () => {
+    resolved++;
+    return '999999999999@lid';
+  });
+  assert.equal(resolved, 0);
+  assert.deepEqual(addressed.lastMessages, range);
+  assert.deepEqual(readStateMessageRange(addressed), range);
+  assert.equal(new Validator().validate(addressed, readMessageSchema).valid, true);
+  assert.equal(new Validator().validate({ chat: groupJid, lastMessages: range }, markChatUnreadSchema).valid, true);
+  const { client, calls } = mockClient();
+  await syncMessageReadState(client, addressed);
+  assert.deepEqual(calls, [
+    { command: 'chatModify', payload: { markRead: true, lastMessages: range }, jid: groupJid },
+    { command: 'readMessages', payload: [range[1].key] },
+  ]);
+});
+
+test('grupo com recebida terminal sem participante é recusado antes de qualquer efeito', async () => {
+  const { client, calls } = mockClient();
+  const mine = { key: { remoteJid: groupJid, id: 'grupo-enviada', fromMe: true }, messageTimestamp: 1_790_000_101 };
+  for (const participant of [undefined, '', '   ']) {
+    await assert.rejects(syncMessageReadState(client, {
+      readMessages: [],
+      lastMessages: [mine, { key: { remoteJid: groupJid, id: 'grupo-recebida', fromMe: false, participant }, messageTimestamp: 1_790_000_100 }],
+    }), ReadStateValidationError);
+  }
+  assert.deepEqual(calls, []);
+});
