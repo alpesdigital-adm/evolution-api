@@ -45,6 +45,24 @@ export const whatsappNumberSchema: JSONSchema7 = {
   },
 };
 
+const readStateMessageSchema: JSONSchema7 = {
+  type: 'object',
+  properties: {
+    key: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', minLength: 1 },
+        fromMe: { type: 'boolean' },
+        remoteJid: { type: 'string', minLength: 1 },
+        participant: { type: 'string', minLength: 1 },
+      },
+      required: ['id', 'fromMe', 'remoteJid'],
+    },
+    messageTimestamp: { type: 'integer', minimum: 1 },
+  },
+  required: ['key', 'messageTimestamp'],
+};
+
 export const readMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
@@ -63,26 +81,15 @@ export const readMessageSchema: JSONSchema7 = {
         ...isNotEmpty('id', 'remoteJid'),
       },
     },
-    lastMessage: {
-      type: 'object',
-      properties: {
-        key: {
-          type: 'object',
-          properties: {
-            id: { type: 'string', minLength: 1 },
-            fromMe: { type: 'boolean' },
-            remoteJid: { type: 'string', minLength: 1 },
-            participant: { type: 'string', minLength: 1 },
-          },
-          required: ['id', 'fromMe', 'remoteJid'],
-        },
-        messageTimestamp: { type: 'integer', minimum: 1 },
-      },
-      required: ['key', 'messageTimestamp'],
-    },
+    lastMessage: readStateMessageSchema,
+    lastMessages: { type: 'array', minItems: 1, maxItems: 500, items: readStateMessageSchema },
   },
   required: ['readMessages'],
-  anyOf: [{ properties: { readMessages: { minItems: 1 } } }, { required: ['lastMessage'] }],
+  anyOf: [
+    { properties: { readMessages: { minItems: 1 } } },
+    { required: ['lastMessage'] },
+    { required: ['lastMessages'] },
+  ],
 };
 
 export const archiveChatSchema: JSONSchema7 = {
@@ -118,6 +125,7 @@ export const markChatUnreadSchema: JSONSchema7 = {
   type: 'object',
   properties: {
     chat: { type: 'string' },
+    lastMessages: { type: 'array', minItems: 1, maxItems: 500, items: readStateMessageSchema },
     lastMessage: {
       type: 'object',
       properties: {
@@ -137,7 +145,7 @@ export const markChatUnreadSchema: JSONSchema7 = {
       ...isNotEmpty('messageTimestamp'),
     },
   },
-  required: ['lastMessage'],
+  anyOf: [{ required: ['lastMessage'] }, { required: ['lastMessages'] }, { required: ['chat'] }],
 };
 
 export const deleteMessageSchema: JSONSchema7 = {

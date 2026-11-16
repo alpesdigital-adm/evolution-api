@@ -172,10 +172,10 @@ import {
   ownAccountJids,
   pickLatestMessageId,
   readRequestToChatAddressing,
+  readStateMessageRange,
   ReadStateValidationError,
   resolveReadStateLids,
   syncMessageReadState,
-  toChatAddressingJid,
 } from './read-state';
 import { attachStatusAck } from './status-ack';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
@@ -3792,6 +3792,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markMessageAsRead(data: ReadMessageDto) {
     try {
+      readStateMessageRange(data);
       const addressed = await readRequestToChatAddressing(data, (pn) =>
         this.client.signalRepository.lidMapping.getLIDForPN(pn),
       );
@@ -3858,33 +3859,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async markChatUnread(data: MarkChatUnreadDto) {
     try {
-      let last_message = data.lastMessage;
-      let number = data.chat;
-
-      if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
-        number = last_message?.key?.remoteJid;
+      const supplied = data.lastMessages ?? data.lastMessage;
+      const range = readStateMessageRange(
+        supplied ? data : { lastMessage: data.chat ? await this.getLastMessage(data.chat) : undefined },
+      );
+      if (!range) throw new ReadStateValidationError('Last message not found');
+      if (data.chat && createJid(data.chat) !== createJid(range[0].key.remoteJid)) {
+        throw new ReadStateValidationError('chat and lastMessages must belong to the same chat');
       }
+      const addressed = await readRequestToChatAddressing({ readMessages: [], lastMessages: range }, (pn: string) =>
+        this.client.signalRepository.lidMapping.getLIDForPN(pn),
+      );
+      await this.client.chatModify(
+        { markRead: false, lastMessages: addressed.lastMessages },
+        addressed.lastMessages[0].key.remoteJid,
+      );
 
-      if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
-      }
-
-      const resolveLid = (pn: string) => this.client.signalRepository.lidMapping.getLIDForPN(pn);
-      const chatJid = await toChatAddressingJid(createJid(number), resolveLid);
-      if (last_message?.key?.remoteJid) {
-        last_message = {
-          ...last_message,
-          key: { ...last_message.key, remoteJid: await toChatAddressingJid(last_message.key.remoteJid, resolveLid) },
-        };
-      }
-      await this.client.chatModify({ markRead: false, lastMessages: [last_message] }, chatJid);
-
-      return { chatId: number, markedChatUnread: true };
+      return { chatId: range[0].key.remoteJid, markedChatUnread: true };
     } catch (error) {
+      if (error instanceof ReadStateValidationError) throw new BadRequestException(error.message);
       throw new InternalServerErrorException({
         markedChatUnread: false,
         message: ['An error occurred while marked unread the chat. Open a calling.', error.toString()],

@@ -45,6 +45,9 @@ export class ChatRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
+      .get(this.routerPath('readStateCapabilities'), ...guards, (_req, res) => {
+        return res.status(HttpStatus.OK).json({ lastMessages: 1 });
+      })
       .post(this.routerPath('whatsappNumbers'), ...guards, async (req, res) => {
         try {
           const response = await this.dataValidate<WhatsAppNumberDto>({
